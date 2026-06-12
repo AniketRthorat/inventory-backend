@@ -11,11 +11,10 @@
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.8.19",
 		"vitest": "~3.2.0",
-		"wrangler": "^4.50.0"
+		"wrangler": "^4.98.0"
 	},
 	"dependencies": {
 		"bcryptjs": "^3.0.3",
-
 		"jose": "^6.1.2"
 	}
 }

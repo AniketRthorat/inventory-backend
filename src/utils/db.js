@@ -146,6 +146,30 @@ export const getDb = (db) => {
             const { results } = await db.prepare('SELECT * FROM devices WHERE device_id = ?').bind(id).all();
             return results[0];
         },
+        async getDeviceByIdPublic(id) {
+            const query = `
+                SELECT 
+                    d.device_name, 
+                    d.device_type, 
+                    d.company, 
+                    d.status,
+                    d.ram, 
+                    d.storage, 
+                    d.cpu,
+                    d.display_size,
+                    d.last_maintenance_date,
+                    d.invoice_number,
+                    d.ip_generation,
+                    l.lab_name,
+                    f.faculty_name
+                FROM devices d
+                LEFT JOIN labs l ON d.lab_id = l.lab_id
+                LEFT JOIN faculty f ON d.faculty_id = f.faculty_id
+                WHERE d.device_id = ?
+            `;
+            const { results } = await db.prepare(query).bind(id).all();
+            return results[0];
+        },
         async createDevice(deviceData) {
             const formatString = (str) => {
                 if (!str || str === 'N/A') return str;
@@ -214,12 +238,73 @@ export const getDb = (db) => {
             return success;
         },
 
+        async getAllInvoices() {
+            const { results } = await db.prepare(`
+                SELECT 
+                    i.invoice_number, 
+                    i.updated_at,
+                    COUNT(d.device_id) as device_count
+                FROM invoices i
+                LEFT JOIN devices d ON i.invoice_number = d.invoice_number
+                GROUP BY i.invoice_number
+            `).all();
+            return results;
+        },
+
+        async getInvoiceByNumber(invoice_number) {
+            const invoice = await db.prepare('SELECT invoice_number, updated_at, created_at FROM invoices WHERE invoice_number = ?').bind(invoice_number).first();
+            if (!invoice) return null;
+
+            const devices = await db.prepare(`
+                SELECT device_id, device_name, device_type, status
+                FROM devices
+                WHERE invoice_number = ?
+            `).bind(invoice_number).all();
+
+            return {
+                ...invoice,
+                devices: devices.results
+            };
+        },
+
+        async getInvoicePdf(invoice_number) {
+            const result = await db.prepare('SELECT invoice_pdf FROM invoices WHERE invoice_number = ?').bind(invoice_number).first();
+            return result ? result.invoice_pdf : null;
+        },
+
         async addInvoiceToDevices(invoice_number, invoice_pdf, device_ids) {
-            const statements = device_ids.map(device_id => {
-                return db.prepare(
-                    'UPDATE devices SET invoice_number = ?, invoice_pdf = ?, updated_at = CURRENT_TIMESTAMP WHERE device_id = ?'
-                ).bind(invoice_number, invoice_pdf, device_id);
-            });
+            const statements = [];
+
+            // 1. Upsert the invoice in the invoices table
+            if (invoice_pdf) {
+                statements.push(
+                    db.prepare(`
+                        INSERT INTO invoices (invoice_number, invoice_pdf) 
+                        VALUES (?, ?)
+                        ON CONFLICT(invoice_number) DO UPDATE SET 
+                            invoice_pdf = excluded.invoice_pdf,
+                            updated_at = CURRENT_TIMESTAMP
+                    `).bind(invoice_number, invoice_pdf)
+                );
+            } else {
+                // Just ensure the invoice entry exists if only linking devices
+                statements.push(
+                    db.prepare(`
+                        INSERT OR IGNORE INTO invoices (invoice_number) VALUES (?)
+                    `).bind(invoice_number)
+                );
+            }
+
+            // 2. Link devices to this invoice number
+            if (device_ids && device_ids.length > 0) {
+                device_ids.forEach(device_id => {
+                    statements.push(
+                        db.prepare(
+                            'UPDATE devices SET invoice_number = ?, updated_at = CURRENT_TIMESTAMP WHERE device_id = ?'
+                        ).bind(invoice_number, device_id)
+                    );
+                });
+            }
 
             if (statements.length === 0) {
                 return { success: true, count: 0 };
@@ -228,8 +313,55 @@ export const getDb = (db) => {
             const results_batch = await db.batch(statements);
             return {
                 success: results_batch.every(r => r.success),
-                count: statements.length
+                count: device_ids ? device_ids.length : 0
             };
+        },
+
+        async deleteInvoice(invoice_number) {
+            const statements = [
+                // 1. Unmap invoice from devices
+                db.prepare('UPDATE devices SET invoice_number = NULL WHERE invoice_number = ?').bind(invoice_number),
+                // 2. Delete the invoice itself
+                db.prepare('DELETE FROM invoices WHERE invoice_number = ?').bind(invoice_number)
+            ];
+            const results = await db.batch(statements);
+            return results.every(r => r.success);
+        },
+
+        async updateInvoice(old_invoice_number, new_invoice_number, invoice_pdf = null) {
+            const statements = [];
+
+            // 1. If invoice number changed, update devices first
+            if (old_invoice_number !== new_invoice_number) {
+                statements.push(
+                    db.prepare('UPDATE devices SET invoice_number = ? WHERE invoice_number = ?')
+                        .bind(new_invoice_number, old_invoice_number)
+                );
+            }
+
+            // 2. Update invoice entry
+            if (invoice_pdf) {
+                statements.push(
+                    db.prepare(`
+                        INSERT INTO invoices (invoice_number, invoice_pdf) 
+                        VALUES (?, ?)
+                        ON CONFLICT(invoice_number) DO UPDATE SET 
+                            invoice_pdf = excluded.invoice_pdf,
+                            updated_at = CURRENT_TIMESTAMP
+                    `).bind(new_invoice_number, invoice_pdf)
+                );
+            } else if (old_invoice_number !== new_invoice_number) {
+                // Update the number in the invoices table if it changed but no new PDF
+                statements.push(
+                    db.prepare('UPDATE invoices SET invoice_number = ?, updated_at = CURRENT_TIMESTAMP WHERE invoice_number = ?')
+                        .bind(new_invoice_number, old_invoice_number)
+                );
+            }
+
+            if (statements.length === 0) return true;
+
+            const results = await db.batch(statements);
+            return results.every(r => r.success);
         },
 
         // Device Management

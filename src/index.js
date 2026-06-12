@@ -53,70 +53,65 @@ CREATE TABLE IF NOT EXISTS users (
 
 const allowedOrigins = [
     'https://cseinventory.cse-tech.workers.dev',
-    'http://localhost:3000', // For local development
-    'http://localhost:3001', // Added for local development
-    'http://localhost:56402', // Added for local development
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://localhost:56402',
+    'http://localhost:51350',
     'http://sgideadstock.sginstitute.in',
 ];
+
+// Helper to handle CORS headers consistently
+const getCorsHeaders = (request) => {
+    const origin = request.headers.get('Origin');
+    let allowedOrigin = allowedOrigins[0]; // Default to first whitelisted origin
+
+    if (origin) {
+        const isLocal = origin.includes('localhost') || origin.includes('127.0.0.1');
+        const isProduction = origin.endsWith('cse-tech.workers.dev') || origin.includes('sginstitute.in');
+        const isWhitelisted = allowedOrigins.includes(origin);
+        
+        if (isLocal || isProduction || isWhitelisted) {
+            allowedOrigin = origin;
+        }
+    }
+
+    return {
+        'Access-Control-Allow-Origin': allowedOrigin,
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Max-Age': '86400',
+    };
+};
 
 const router = new Router();
 
 // CORS handling (placed first to act as middleware)
 router.all('*', (request) => {
-    const origin = request.headers.get('Origin');
-    const allowedOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
-
-    // Handle preflight OPTIONS requests
     if (request.method === 'OPTIONS') {
         return new Response(null, {
-            headers: {
-                'Access-Control-Allow-Origin': allowedOrigin,
-                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-                'Access-Control-Max-Age': '86400', // Cache preflight for 24 hours
-            },
+            headers: getCorsHeaders(request),
         });
     }
-    return undefined; // Explicitly return undefined for non-OPTIONS requests to continue routing
+    return undefined;
 });
 
-// Helper function to generate JWT token
-async function generateToken(user_id, env) {
-    const secret = new TextEncoder().encode(env.JWT_SECRET);
-    const alg = 'HS256';
-    const jwt = await new SignJWT({ user_id })
-        .setProtectedHeader({ alg })
-        .setExpirationTime('2h') // Token expires in 2 hours
-        .sign(secret);
-    return jwt;
-}
+// ... (keep the rest of the router definitions)
 
-// Middleware to verify JWT token
-async function authenticate(request, env) {
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return new Response('Unauthorized', { status: 401 });
-    }
-    const token = authHeader.split(' ')[1];
-    try {
-        const secret = new TextEncoder().encode(env.JWT_SECRET);
-        const { payload } = await jwtVerify(token, secret);
-        request.user_id = payload.user_id; // Attach user_id to request
-    } catch (error) {
-        return new Response('Invalid or expired token', { status: 401 });
-    }
-}
-
-// Add CORS headers to all responses (applied at the end of fetch)
+// Add CORS headers to all responses
 const addCorsHeaders = (response, request) => {
-    const origin = request.headers.get('Origin');
-    const allowedOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
+    const corsHeaders = getCorsHeaders(request);
+    const newHeaders = new Headers(response.headers);
+    
+    Object.entries(corsHeaders).forEach(([key, value]) => {
+        newHeaders.set(key, value);
+    });
 
-    response.headers.set('Access-Control-Allow-Origin', allowedOrigin);
-    response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    response.headers.set('Access-Control-Allow-Credentials', 'true'); // Important for sending cookies/auth headers
-    return response;
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: newHeaders,
+    });
 };
 
 
@@ -181,6 +176,14 @@ router.get('/api/init-db', async (request, env) => {
                   email TEXT NOT NULL UNIQUE,
                   password TEXT,
                   google_id TEXT UNIQUE,
+                  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+            `),
+            env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS invoices (
+                  invoice_number TEXT PRIMARY KEY,
+                  invoice_pdf TEXT,
                   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
@@ -669,8 +672,8 @@ router.post('/api/devices', async (request, env) => {
         let invoicePdfBase64 = null;
         if (invoicePdf && invoicePdf.name) {
             // Server-side validation for PDF size
-            if (invoicePdf.size > 1024 * 1024) { // 1MB limit
-                return new Response('Invoice PDF size cannot exceed 1MB.', { status: 400 });
+            if (invoicePdf.size > 500 * 1024) { // 500KB limit
+                return new Response('Invoice PDF size cannot exceed 500KB.', { status: 400 });
             }
 
             const arrayBuffer = await invoicePdf.arrayBuffer();
@@ -724,34 +727,168 @@ router.post('/api/invoices', async (request, env) => {
         const invoice_number = formData.get('invoice_number');
         const invoice_pdf = formData.get('invoice_pdf');
         const device_ids_json = formData.get('device_ids');
-        const device_ids = JSON.parse(device_ids_json);
+        const device_ids = device_ids_json ? JSON.parse(device_ids_json) : [];
 
-        if (!invoice_number || !invoice_pdf || !device_ids || device_ids.length === 0) {
-            return new Response('Invoice number, PDF, and at least one device ID are required', { status: 400 });
+        if (!invoice_number) {
+            return new Response('Invoice number is required', { status: 400 });
         }
 
-        if (invoice_pdf.size > 1024 * 1024) { // 1MB limit
-            return new Response('Invoice PDF size cannot exceed 1MB.', { status: 400 });
+        let invoicePdfBase64 = null;
+        if (invoice_pdf && invoice_pdf.size > 0) {
+            if (invoice_pdf.size > 500 * 1024) { // 500KB limit
+                return new Response('Invoice PDF size cannot exceed 500KB.', { status: 400 });
+            }
+            const arrayBuffer = await invoice_pdf.arrayBuffer();
+            invoicePdfBase64 = arrayBufferToBase64(arrayBuffer);
         }
-
-        const arrayBuffer = await invoice_pdf.arrayBuffer();
-        const invoicePdfBase64 = arrayBufferToBase64(arrayBuffer);
 
         const { success, count } = await db.addInvoiceToDevices(invoice_number, invoicePdfBase64, device_ids);
 
         if (success) {
-            return new Response(JSON.stringify({ message: `Invoice added to ${count} devices successfully` }), {
+            return new Response(JSON.stringify({ message: `Invoice processed for ${count} devices successfully` }), {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' },
             });
         } else {
-            return new Response('Failed to add invoice to devices', { status: 500 });
+            return new Response('Failed to process invoice', { status: 500 });
         }
     } catch (error) {
         return new Response(`Error adding invoice: ${error.message}`, { status: 500 });
     }
 });
 
+router.get('/api/invoices', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const invoices = await db.getAllInvoices();
+        return new Response(JSON.stringify(invoices), {
+            headers: { 'Content-Type': 'application/json' },
+        });
+    } catch (error) {
+        return new Response(`Error fetching invoices: ${error.message}`, { status: 500 });
+    }
+});
+
+router.get('/api/invoices/:invoiceNumber', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { invoiceNumber } = request.params;
+        const invoiceData = await db.getInvoiceByNumber(invoiceNumber);
+        if (invoiceData) {
+            return new Response(JSON.stringify(invoiceData), {
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } else {
+            return new Response('Invoice not found', { status: 404 });
+        }
+    } catch (error) {
+        return new Response(`Error fetching invoice details: ${error.message}`, { status: 500 });
+    }
+});
+
+router.get('/api/invoices/:invoiceNumber/pdf', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { invoiceNumber } = request.params;
+        const pdfBase64 = await db.getInvoicePdf(invoiceNumber);
+        if (pdfBase64) {
+            return new Response(JSON.stringify({ invoice_pdf: pdfBase64 }), {
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } else {
+            return new Response('Invoice PDF not found', { status: 404 });
+        }
+    } catch (error) {
+        return new Response(`Error fetching invoice PDF: ${error.message}`, { status: 500 });
+    }
+});
+
+router.delete('/api/invoices/:invoiceNumber', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { invoiceNumber } = request.params;
+        const success = await db.deleteInvoice(invoiceNumber);
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Invoice deleted successfully' }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } else {
+            return new Response('Failed to delete invoice', { status: 500 });
+        }
+    } catch (error) {
+        return new Response(`Error deleting invoice: ${error.message}`, { status: 500 });
+    }
+});
+
+router.put('/api/invoices/:invoiceNumber', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { invoiceNumber } = request.params;
+        const formData = await request.formData();
+        const new_invoice_number = formData.get('invoice_number');
+        const invoice_pdf = formData.get('invoice_pdf');
+
+        let invoicePdfBase64 = null;
+        if (invoice_pdf && invoice_pdf.size > 0) {
+            if (invoice_pdf.size > 500 * 1024) { // 500KB limit
+                return new Response('Invoice PDF size cannot exceed 500KB.', { status: 400 });
+            }
+            const arrayBuffer = await invoice_pdf.arrayBuffer();
+            invoicePdfBase64 = arrayBufferToBase64(arrayBuffer);
+        }
+
+        const success = await db.updateInvoice(invoiceNumber, new_invoice_number, invoicePdfBase64);
+
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Invoice updated successfully' }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } else {
+            return new Response('Failed to update invoice', { status: 500 });
+        }
+    } catch (error) {
+        return new Response(`Error updating invoice: ${error.message}`, { status: 500 });
+    }
+});
+
+
+router.get('/api/public/devices/:code', async (request, env) => {
+    const db = getDb(env.DB);
+    const { code } = request.params;
+
+    // Decode logic
+    const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const decodeDeviceId = (c) => {
+        let str = c.startsWith('SGI-') ? c.substring(4) : c;
+        let num = 0;
+        for (let i = 0; i < str.length; i++) {
+            const index = BASE62.indexOf(str[i]);
+            if (index === -1) return null;
+            num = num * 62 + index;
+        }
+        return num - 10000;
+    };
+
+    const deviceId = decodeDeviceId(code);
+    if (deviceId === null || deviceId < 0) {
+        return new Response('Invalid code format', { status: 400 });
+    }
+
+    try {
+        const device = await db.getDeviceByIdPublic(deviceId);
+        if (device) {
+            return new Response(JSON.stringify(device), {
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } else {
+            return new Response('Device not found', { status: 404 });
+        }
+    } catch (error) {
+        return new Response(`Error fetching device: ${error.message}`, { status: 500 });
+    }
+});
 
 router.get('/api/devices/:id', async (request, env) => {
     const db = getDb(env.DB);
