@@ -53,11 +53,12 @@ CREATE TABLE IF NOT EXISTS users (
 
 const allowedOrigins = [
     'https://cseinventory.cse-tech.workers.dev',
+    'http://sgideadstock.sginstitute.in',
+    'https://sgideadstock.sginstitute.in',
     'http://localhost:3000',
     'http://localhost:3001',
     'http://localhost:56402',
     'http://localhost:51350',
-    'http://sgideadstock.sginstitute.in',
 ];
 
 // Helper to handle CORS headers consistently
@@ -117,6 +118,17 @@ const addCorsHeaders = (response, request) => {
 
 router.get('/', () => {
     return new Response('Hello World from Inventory Backend!');
+});
+
+// Health check for /api — confirms the worker is live
+router.get('/api', () => {
+    return new Response(JSON.stringify({
+        status: 'ok',
+        message: 'Inventory Backend API is running on Cloudflare Workers',
+        endpoints: ['/api/labs', '/api/faculty', '/api/devices', '/api/invoices', '/api/dashboard'],
+    }), {
+        headers: { 'Content-Type': 'application/json' },
+    });
 });
 
 router.get('/api/init-db', async (request, env) => {
@@ -187,9 +199,50 @@ router.get('/api/init-db', async (request, env) => {
                   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+            `),
+            env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS maintenance_logs (
+                  log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  device_id INTEGER NOT NULL,
+                  assistant_name TEXT NOT NULL,
+                  changes_made TEXT NOT NULL,
+                  maintenance_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+                );
+            `),
+            env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS issues (
+                  issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  device_id INTEGER,
+                  lab_id INTEGER,
+                  student_class TEXT,
+                  student_div TEXT,
+                  student_roll_no TEXT,
+                  description TEXT NOT NULL,
+                  status TEXT DEFAULT 'pending',
+                  reported_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                  resolved_at TEXT,
+                  action_taken TEXT,
+                  FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE,
+                  FOREIGN KEY (lab_id) REFERENCES labs(lab_id) ON DELETE CASCADE
+                );
             `)
         ];
         await env.DB.batch(statements);
+
+        // Attempt to add assistant_name to labs table, ignore error if it already exists
+        try {
+            await env.DB.prepare("ALTER TABLE labs ADD COLUMN assistant_name TEXT").run();
+        } catch (e) {
+            // Ignore column exists error
+        }
+
+        // Attempt to add action_taken to issues table, ignore error if it already exists
+        try {
+            await env.DB.prepare("ALTER TABLE issues ADD COLUMN action_taken TEXT").run();
+        } catch (e) {
+            // Ignore column exists error
+        }
 
         return new Response('Database schema initialized successfully!', { status: 200 });
     } catch (error) {
@@ -436,11 +489,11 @@ router.get('/api/labs', async (request, env) => {
 router.post('/api/labs', async (request, env) => {
     const db = getDb(env.DB);
     try {
-        const { lab_name, location, capacity } = await request.json();
+        const { lab_name, location, capacity, assistant_name } = await request.json();
         if (!lab_name) {
             return new Response('Lab name is required', { status: 400 });
         }
-        const success = await db.createLab(lab_name, location, capacity);
+        const success = await db.createLab(lab_name, location, capacity, assistant_name);
         if (success) {
             return new Response(JSON.stringify({ message: 'Lab created successfully' }), {
                 status: 201,
@@ -475,11 +528,11 @@ router.put('/api/labs/:id', async (request, env) => {
     const db = getDb(env.DB);
     try {
         const { id } = request.params;
-        const { lab_name, location, capacity } = await request.json();
+        const { lab_name, location, capacity, assistant_name } = await request.json();
         if (!lab_name) {
             return new Response('Lab name is required', { status: 400 });
         }
-        const success = await db.updateLab(id, lab_name, location, capacity);
+        const success = await db.updateLab(id, lab_name, location, capacity, assistant_name);
         if (success) {
             return new Response(JSON.stringify({ message: 'Lab updated successfully' }), {
                 status: 200,
@@ -890,6 +943,115 @@ router.get('/api/public/devices/:code', async (request, env) => {
     }
 });
 
+// POST: Lab assistant logs a maintenance entry after scanning QR (no auth needed)
+router.post('/api/public/devices/:code/maintenance', async (request, env) => {
+    const db = getDb(env.DB);
+    const { code } = request.params;
+
+    const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const decodeDeviceId = (c) => {
+        let str = c.startsWith('SGI-') ? c.substring(4) : c;
+        let num = 0;
+        for (let i = 0; i < str.length; i++) {
+            const index = BASE62.indexOf(str[i]);
+            if (index === -1) return null;
+            num = num * 62 + index;
+        }
+        return num - 10000;
+    };
+
+    const deviceId = decodeDeviceId(code);
+    if (deviceId === null || deviceId < 0) {
+        return new Response(JSON.stringify({ error: 'Invalid device code' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    try {
+        const { assistant_name, changes_made } = await request.json();
+        if (!assistant_name || !assistant_name.trim()) {
+            return new Response(JSON.stringify({ error: 'Assistant name is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (!changes_made || !changes_made.trim()) {
+            return new Response(JSON.stringify({ error: 'Changes description is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        const success = await db.addMaintenanceLog(deviceId, assistant_name.trim(), changes_made.trim());
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Maintenance log recorded successfully' }), {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } else {
+            return new Response(JSON.stringify({ error: 'Failed to record maintenance log' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+});
+
+// GET: Fetch maintenance history for a device by QR code (no auth needed)
+router.get('/api/public/devices/:code/maintenance', async (request, env) => {
+    const db = getDb(env.DB);
+    const { code } = request.params;
+
+    const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const decodeDeviceId = (c) => {
+        let str = c.startsWith('SGI-') ? c.substring(4) : c;
+        let num = 0;
+        for (let i = 0; i < str.length; i++) {
+            const index = BASE62.indexOf(str[i]);
+            if (index === -1) return null;
+            num = num * 62 + index;
+        }
+        return num - 10000;
+    };
+
+    const deviceId = decodeDeviceId(code);
+    if (deviceId === null || deviceId < 0) {
+        return new Response(JSON.stringify({ error: 'Invalid device code' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    try {
+        const logs = await db.getMaintenanceLogs(deviceId);
+        return new Response(JSON.stringify(logs), {
+            headers: { 'Content-Type': 'application/json' },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+});
+
+// GET: Fetch maintenance history by device_id (for admin view)
+router.get('/api/devices/:id/maintenance', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { id } = request.params;
+        const logs = await db.getMaintenanceLogs(id);
+        return new Response(JSON.stringify(logs), {
+            headers: { 'Content-Type': 'application/json' },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+});
+
+// DELETE: Delete a maintenance log (admin)
+router.delete('/api/devices/:id/maintenance/:logId', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { logId } = request.params;
+        const success = await db.deleteMaintenanceLog(logId);
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Log deleted successfully' }), {
+                headers: { 'Content-Type': 'application/json' },
+            });
+        } else {
+            return new Response(JSON.stringify({ error: 'Failed to delete log' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+});
+
 router.get('/api/devices/:id', async (request, env) => {
     const db = getDb(env.DB);
     try {
@@ -1087,6 +1249,139 @@ router.put('/api/devices/:id/deadstock-parts', async (request, env) => {
 });
 
 
+// ==========================================
+// ISSUES & LAB ASSISTANT ROUTES
+// ==========================================
+
+// Student reports an issue
+router.post('/api/public/devices/:code/issues', async (request, env) => {
+    const db = getDb(env.DB);
+    const { code } = request.params;
+
+    const BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const decodeDeviceId = (c) => {
+        let str = c.startsWith('SGI-') ? c.substring(4) : c;
+        let num = 0;
+        for (let i = 0; i < str.length; i++) {
+            const index = BASE62.indexOf(str[i]);
+            if (index === -1) return null;
+            num = num * 62 + index;
+        }
+        return num - 10000;
+    };
+
+    const deviceId = decodeDeviceId(code);
+    if (deviceId === null || deviceId < 0) {
+        return new Response(JSON.stringify({ error: 'Invalid device code' }), { status: 400 });
+    }
+
+    try {
+        const { lab_id, student_class, student_div, student_roll_no, description } = await request.json();
+        
+        const success = await db.reportIssue(deviceId, lab_id, student_class, student_div, student_roll_no, description);
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Issue reported successfully' }), {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        }
+        return new Response(JSON.stringify({ error: 'Failed to report issue' }), { status: 500 });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
+// Get Lab Assistant Issues (<= 48h)
+router.get('/api/issues/lab-assistant', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const issues = await db.getLabAssistantIssues();
+        return new Response(JSON.stringify(issues), { headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
+// Get Escalated Issues (> 48h)
+router.get('/api/issues/escalated', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const issues = await db.getEscalatedIssues();
+        return new Response(JSON.stringify(issues), { headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
+// Get All Pending Issues
+router.get('/api/issues/pending', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const issues = await db.getPendingIssues();
+        return new Response(JSON.stringify(issues), { headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
+// Get All Resolved Issues
+router.get('/api/issues/resolved', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const issues = await db.getResolvedIssues();
+        return new Response(JSON.stringify(issues), { headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
+// Resolve Issue
+router.put('/api/issues/:id/resolve', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { id } = request.params;
+        const { action_taken } = await request.json().catch(() => ({}));
+        const success = await db.resolveIssue(id, action_taken);
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Issue resolved' }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ error: 'Failed to resolve issue' }), { status: 500 });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
+// Delete Issue (Admin Only)
+router.delete('/api/issues/:id', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { id } = request.params;
+        const success = await db.deleteIssue(id);
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Issue deleted' }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ error: 'Failed to delete issue' }), { status: 500 });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
+// Update Lab Assistant
+router.put('/api/labs/:id/assistant', async (request, env) => {
+    const db = getDb(env.DB);
+    try {
+        const { id } = request.params;
+        const { assistant_name } = await request.json();
+        const success = await db.updateLabAssistant(id, assistant_name);
+        if (success) {
+            return new Response(JSON.stringify({ message: 'Lab assistant updated' }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ error: 'Failed to update lab assistant' }), { status: 500 });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    }
+});
+
 router.get('/api/maintenance/capitalize-names', async (request, env) => {
     const db = getDb(env.DB);
     try {
@@ -1113,6 +1408,13 @@ router.get('/api/maintenance/migrate-defective-stock', async (request, env) => {
     } catch (error) {
         return new Response(`Error during migration: ${error.message}`, { status: 500 });
     }
+});
+
+// Redirect route for old/wrong QR code URLs
+router.get('/device/:code', (request) => {
+    const { code } = request.params;
+    // Redirect to the production frontend using a query param to avoid server-side 404
+    return Response.redirect(`http://sgideadstock.sginstitute.in/?device=${code}`, 302);
 });
 
 // Final 404 handler (placed last)

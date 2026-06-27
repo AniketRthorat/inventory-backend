@@ -11,34 +11,42 @@ export const getDb = (db) => {
             const { results } = await db.prepare('SELECT * FROM labs WHERE lab_id = ?').bind(id).all();
             return results[0];
         },
-        async createLab(lab_name, location, capacity) {
+        async createLab(lab_name, location, capacity, assistant_name = null) {
             const formatString = (str) => {
                 if (!str || str === 'N/A') return str;
                 return str.split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
             };
             const capitalizedName = formatString(lab_name);
+            const capitalizedAssistantName = formatString(assistant_name);
             const { success } = await db.prepare(
-                'INSERT INTO labs (lab_name, location, capacity) VALUES (?, ?, ?)'
+                'INSERT INTO labs (lab_name, location, capacity, assistant_name) VALUES (?, ?, ?, ?)'
             )
-                .bind(capitalizedName, location, capacity)
+                .bind(capitalizedName, location, capacity, capitalizedAssistantName)
                 .run();
             return success;
         },
-        async updateLab(id, lab_name, location, capacity) {
+        async updateLab(id, lab_name, location, capacity, assistant_name = null) {
             const formatString = (str) => {
                 if (!str || str === 'N/A') return str;
                 return str.split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
             };
             const capitalizedName = formatString(lab_name);
+            const capitalizedAssistantName = formatString(assistant_name);
             const { success } = await db.prepare(
-                'UPDATE labs SET lab_name = ?, location = ?, capacity = ?, updated_at = CURRENT_TIMESTAMP WHERE lab_id = ?'
+                'UPDATE labs SET lab_name = ?, location = ?, capacity = ?, assistant_name = ?, updated_at = CURRENT_TIMESTAMP WHERE lab_id = ?'
             )
-                .bind(capitalizedName, location, capacity, id)
+                .bind(capitalizedName, location, capacity, capitalizedAssistantName, id)
                 .run();
             return success;
         },
         async deleteLab(id) {
             const { success } = await db.prepare('DELETE FROM labs WHERE lab_id = ?').bind(id).run();
+            return success;
+        },
+        async updateLabAssistant(id, assistant_name) {
+            const { success } = await db.prepare(
+                'UPDATE labs SET assistant_name = ? WHERE lab_id = ?'
+            ).bind(assistant_name, id).run();
             return success;
         },
 
@@ -658,6 +666,111 @@ export const getDb = (db) => {
             } catch (error) {
                 throw error;
             }
+        },
+
+        // Maintenance Logs
+        async addMaintenanceLog(device_id, assistant_name, changes_made) {
+            const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+            const statements = [
+                // Insert the maintenance log
+                db.prepare(
+                    'INSERT INTO maintenance_logs (device_id, assistant_name, changes_made, maintenance_date) VALUES (?, ?, ?, ?)'
+                ).bind(device_id, assistant_name, changes_made, today),
+                // Update last_maintenance_date on the device
+                db.prepare(
+                    'UPDATE devices SET last_maintenance_date = ?, updated_at = CURRENT_TIMESTAMP WHERE device_id = ?'
+                ).bind(today, device_id),
+            ];
+            const results = await db.batch(statements);
+            return results.every(r => r.success);
+        },
+
+        async getMaintenanceLogs(device_id) {
+            const { results } = await db.prepare(
+                'SELECT log_id, assistant_name, changes_made, maintenance_date FROM maintenance_logs WHERE device_id = ? ORDER BY maintenance_date DESC, log_id DESC'
+            ).bind(device_id).all();
+            return results;
+        },
+
+        async deleteMaintenanceLog(log_id) {
+            const result = await db.prepare(
+                'DELETE FROM maintenance_logs WHERE log_id = ?'
+            ).bind(log_id).run();
+            return result.success;
+        },
+
+        // Issues
+        async reportIssue(device_id, lab_id, student_class, student_div, student_roll_no, description) {
+            const { success } = await db.prepare(
+                'INSERT INTO issues (device_id, lab_id, student_class, student_div, student_roll_no, description) VALUES (?, ?, ?, ?, ?, ?)'
+            ).bind(device_id, lab_id, student_class, student_div, student_roll_no, description).run();
+            return success;
+        },
+
+        async getLabAssistantIssues() {
+            // Pending issues <= 48 hours old
+            const { results } = await db.prepare(`
+                SELECT i.*, l.lab_name, l.assistant_name, d.device_name 
+                FROM issues i 
+                LEFT JOIN labs l ON i.lab_id = l.lab_id 
+                LEFT JOIN devices d ON i.device_id = d.device_id 
+                WHERE i.status = 'pending' AND (julianday(CURRENT_TIMESTAMP) - julianday(i.reported_at)) * 24 <= 48 
+                ORDER BY i.reported_at ASC
+            `).all();
+            return results;
+        },
+
+        async getEscalatedIssues() {
+            // Pending issues > 48 hours old
+            const { results } = await db.prepare(`
+                SELECT i.*, l.lab_name, l.assistant_name, d.device_name 
+                FROM issues i 
+                LEFT JOIN labs l ON i.lab_id = l.lab_id 
+                LEFT JOIN devices d ON i.device_id = d.device_id 
+                WHERE i.status = 'pending' AND (julianday(CURRENT_TIMESTAMP) - julianday(i.reported_at)) * 24 > 48 
+                ORDER BY i.reported_at ASC
+            `).all();
+            return results;
+        },
+
+        async getPendingIssues() {
+            // All pending issues
+            const { results } = await db.prepare(`
+                SELECT i.*, l.lab_name, l.assistant_name, d.device_name 
+                FROM issues i 
+                LEFT JOIN labs l ON i.lab_id = l.lab_id 
+                LEFT JOIN devices d ON i.device_id = d.device_id 
+                WHERE i.status = 'pending' 
+                ORDER BY i.reported_at ASC
+            `).all();
+            return results;
+        },
+
+        async getResolvedIssues() {
+            // All resolved issues
+            const { results } = await db.prepare(`
+                SELECT i.*, l.lab_name, l.assistant_name, d.device_name 
+                FROM issues i 
+                LEFT JOIN labs l ON i.lab_id = l.lab_id 
+                LEFT JOIN devices d ON i.device_id = d.device_id 
+                WHERE i.status = 'resolved' 
+                ORDER BY i.resolved_at DESC
+            `).all();
+            return results;
+        },
+
+        async resolveIssue(issue_id, action_taken) {
+            const { success } = await db.prepare(
+                "UPDATE issues SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, action_taken = ? WHERE issue_id = ?"
+            ).bind(action_taken || '', issue_id).run();
+            return success;
+        },
+
+        async deleteIssue(issue_id) {
+            const { success } = await db.prepare(
+                "DELETE FROM issues WHERE issue_id = ?"
+            ).bind(issue_id).run();
+            return success;
         },
 
         async capitalizeExistingNames() {
