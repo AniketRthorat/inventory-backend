@@ -169,6 +169,7 @@ export const getDb = (db) => {
                     d.invoice_number,
                     d.ip_generation,
                     l.lab_name,
+                    l.assistant_name,
                     f.faculty_name
                 FROM devices d
                 LEFT JOIN labs l ON d.lab_id = l.lab_id
@@ -637,10 +638,11 @@ export const getDb = (db) => {
                         SELECT
                             l.lab_id,
                             l.lab_name as lab,
+                            l.assistant_name,
                             COUNT(d.device_id) as count
                         FROM labs l
                         LEFT JOIN devices d ON l.lab_id = d.lab_id AND d.status = 'active'
-                        GROUP BY l.lab_id, l.lab_name
+                        GROUP BY l.lab_id, l.lab_name, l.assistant_name
                         ORDER BY l.lab_name
                     `).all(),
                 ]);

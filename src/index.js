@@ -1341,8 +1341,23 @@ router.put('/api/issues/:id/resolve', async (request, env) => {
     try {
         const { id } = request.params;
         const { action_taken } = await request.json().catch(() => ({}));
+        
+        // Get device_id and description of the issue to create a maintenance log
+        const issue = await env.DB.prepare(`
+            SELECT i.device_id, i.description, l.assistant_name 
+            FROM issues i 
+            LEFT JOIN labs l ON i.lab_id = l.lab_id 
+            WHERE i.issue_id = ?
+        `).bind(id).first();
+
         const success = await db.resolveIssue(id, action_taken);
+        
         if (success) {
+            if (issue && issue.device_id) {
+                const assistantName = issue.assistant_name || 'Lab Assistant';
+                const changesMade = `Resolved Issue: "${issue.description}". Action Taken: ${action_taken || 'N/A'}`;
+                await db.addMaintenanceLog(issue.device_id, assistantName, changesMade);
+            }
             return new Response(JSON.stringify({ message: 'Issue resolved' }), { headers: { 'Content-Type': 'application/json' } });
         }
         return new Response(JSON.stringify({ error: 'Failed to resolve issue' }), { status: 500 });
