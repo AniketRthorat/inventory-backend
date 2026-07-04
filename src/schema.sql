@@ -10,6 +10,8 @@ CREATE TABLE labs (
   lab_name TEXT NOT NULL UNIQUE,
   location TEXT,
   capacity INTEGER,
+  assistant_name TEXT,
+  assistant_phone TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );

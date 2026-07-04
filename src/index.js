@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS labs (
   lab_name TEXT NOT NULL UNIQUE,
   location TEXT,
   capacity INTEGER,
+  assistant_name TEXT,
+  assistant_phone TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -141,6 +143,8 @@ router.get('/api/init-db', async (request, env) => {
                   lab_name TEXT NOT NULL UNIQUE,
                   location TEXT,
                   capacity INTEGER,
+                  assistant_name TEXT,
+                  assistant_phone TEXT,
                   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
@@ -233,6 +237,13 @@ router.get('/api/init-db', async (request, env) => {
         // Attempt to add assistant_name to labs table, ignore error if it already exists
         try {
             await env.DB.prepare("ALTER TABLE labs ADD COLUMN assistant_name TEXT").run();
+        } catch (e) {
+            // Ignore column exists error
+        }
+
+        // Attempt to add assistant_phone to labs table, ignore error if it already exists
+        try {
+            await env.DB.prepare("ALTER TABLE labs ADD COLUMN assistant_phone TEXT").run();
         } catch (e) {
             // Ignore column exists error
         }
@@ -489,11 +500,11 @@ router.get('/api/labs', async (request, env) => {
 router.post('/api/labs', async (request, env) => {
     const db = getDb(env.DB);
     try {
-        const { lab_name, location, capacity, assistant_name } = await request.json();
+        const { lab_name, location, capacity, assistant_name, assistant_phone } = await request.json();
         if (!lab_name) {
             return new Response('Lab name is required', { status: 400 });
         }
-        const success = await db.createLab(lab_name, location, capacity, assistant_name);
+        const success = await db.createLab(lab_name, location, capacity, assistant_name, assistant_phone);
         if (success) {
             return new Response(JSON.stringify({ message: 'Lab created successfully' }), {
                 status: 201,
@@ -528,11 +539,11 @@ router.put('/api/labs/:id', async (request, env) => {
     const db = getDb(env.DB);
     try {
         const { id } = request.params;
-        const { lab_name, location, capacity, assistant_name } = await request.json();
+        const { lab_name, location, capacity, assistant_name, assistant_phone } = await request.json();
         if (!lab_name) {
             return new Response('Lab name is required', { status: 400 });
         }
-        const success = await db.updateLab(id, lab_name, location, capacity, assistant_name);
+        const success = await db.updateLab(id, lab_name, location, capacity, assistant_name, assistant_phone);
         if (success) {
             return new Response(JSON.stringify({ message: 'Lab updated successfully' }), {
                 status: 200,
@@ -932,6 +943,8 @@ router.get('/api/public/devices/:code', async (request, env) => {
     try {
         const device = await db.getDeviceByIdPublic(deviceId);
         if (device) {
+            const pendingIssues = await db.getPendingIssuesByDeviceId(deviceId);
+            device.pending_issues = pendingIssues || [];
             return new Response(JSON.stringify(device), {
                 headers: { 'Content-Type': 'application/json' },
             });
@@ -966,7 +979,7 @@ router.post('/api/public/devices/:code/maintenance', async (request, env) => {
     }
 
     try {
-        const { assistant_name, changes_made } = await request.json();
+        const { assistant_name, changes_made, resolved_issue_ids } = await request.json();
         if (!assistant_name || !assistant_name.trim()) {
             return new Response(JSON.stringify({ error: 'Assistant name is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
@@ -974,7 +987,7 @@ router.post('/api/public/devices/:code/maintenance', async (request, env) => {
             return new Response(JSON.stringify({ error: 'Changes description is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        const success = await db.addMaintenanceLog(deviceId, assistant_name.trim(), changes_made.trim());
+        const success = await db.addMaintenanceLog(deviceId, assistant_name.trim(), changes_made.trim(), resolved_issue_ids);
         if (success) {
             return new Response(JSON.stringify({ message: 'Maintenance log recorded successfully' }), {
                 status: 201,
@@ -1254,7 +1267,7 @@ router.put('/api/devices/:id/deadstock-parts', async (request, env) => {
 // ==========================================
 
 // Student reports an issue
-router.post('/api/public/devices/:code/issues', async (request, env) => {
+router.post('/api/public/devices/:code/issues', async (request, env, ctx) => {
     const db = getDb(env.DB);
     const { code } = request.params;
 
@@ -1280,6 +1293,39 @@ router.post('/api/public/devices/:code/issues', async (request, env) => {
         
         const success = await db.reportIssue(deviceId, lab_id, student_class, student_div, student_roll_no, description);
         if (success) {
+            // Attempt to trigger WhatsApp notification to the respective assistant
+            try {
+                const info = await env.DB.prepare(`
+                    SELECT d.device_name, l.lab_name, l.assistant_name, l.assistant_phone 
+                    FROM devices d 
+                    LEFT JOIN labs l ON l.lab_id = ? 
+                    WHERE d.device_id = ?
+                `).bind(lab_id, deviceId).first();
+
+                if (info && info.assistant_phone) {
+                    const { sendWhatsAppNotification } = await import('./utils/sendWhatsApp');
+                    const promise = sendWhatsAppNotification(env, {
+                        assistantPhone: info.assistant_phone,
+                        assistantName: info.assistant_name,
+                        labName: info.lab_name,
+                        deviceName: info.device_name,
+                        deviceCode: code,
+                        studentClass: student_class,
+                        studentDiv: student_div,
+                        studentRollNo: student_roll_no,
+                        description
+                    });
+
+                    if (ctx && typeof ctx.waitUntil === 'function') {
+                        ctx.waitUntil(promise);
+                    } else {
+                        await promise;
+                    }
+                }
+            } catch (whatsappError) {
+                console.error('Failed to trigger WhatsApp notification flow:', whatsappError);
+            }
+
             return new Response(JSON.stringify({ message: 'Issue reported successfully' }), {
                 status: 201,
                 headers: { 'Content-Type': 'application/json' },

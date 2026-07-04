@@ -11,31 +11,33 @@ export const getDb = (db) => {
             const { results } = await db.prepare('SELECT * FROM labs WHERE lab_id = ?').bind(id).all();
             return results[0];
         },
-        async createLab(lab_name, location, capacity, assistant_name = null) {
+        async createLab(lab_name, location, capacity, assistant_name = null, assistant_phone = null) {
             const formatString = (str) => {
                 if (!str || str === 'N/A') return str;
                 return str.split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
             };
             const capitalizedName = formatString(lab_name);
             const capitalizedAssistantName = formatString(assistant_name);
+            const trimmedPhone = assistant_phone ? assistant_phone.trim() : null;
             const { success } = await db.prepare(
-                'INSERT INTO labs (lab_name, location, capacity, assistant_name) VALUES (?, ?, ?, ?)'
+                'INSERT INTO labs (lab_name, location, capacity, assistant_name, assistant_phone) VALUES (?, ?, ?, ?, ?)'
             )
-                .bind(capitalizedName, location, capacity, capitalizedAssistantName)
+                .bind(capitalizedName, location, capacity, capitalizedAssistantName, trimmedPhone)
                 .run();
             return success;
         },
-        async updateLab(id, lab_name, location, capacity, assistant_name = null) {
+        async updateLab(id, lab_name, location, capacity, assistant_name = null, assistant_phone = null) {
             const formatString = (str) => {
                 if (!str || str === 'N/A') return str;
                 return str.split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
             };
             const capitalizedName = formatString(lab_name);
             const capitalizedAssistantName = formatString(assistant_name);
+            const trimmedPhone = assistant_phone ? assistant_phone.trim() : null;
             const { success } = await db.prepare(
-                'UPDATE labs SET lab_name = ?, location = ?, capacity = ?, assistant_name = ?, updated_at = CURRENT_TIMESTAMP WHERE lab_id = ?'
+                'UPDATE labs SET lab_name = ?, location = ?, capacity = ?, assistant_name = ?, assistant_phone = ?, updated_at = CURRENT_TIMESTAMP WHERE lab_id = ?'
             )
-                .bind(capitalizedName, location, capacity, capitalizedAssistantName, id)
+                .bind(capitalizedName, location, capacity, capitalizedAssistantName, trimmedPhone, id)
                 .run();
             return success;
         },
@@ -671,7 +673,7 @@ export const getDb = (db) => {
         },
 
         // Maintenance Logs
-        async addMaintenanceLog(device_id, assistant_name, changes_made) {
+        async addMaintenanceLog(device_id, assistant_name, changes_made, resolved_issue_ids = []) {
             const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
             const statements = [
                 // Insert the maintenance log
@@ -683,6 +685,17 @@ export const getDb = (db) => {
                     'UPDATE devices SET last_maintenance_date = ?, updated_at = CURRENT_TIMESTAMP WHERE device_id = ?'
                 ).bind(today, device_id),
             ];
+
+            if (resolved_issue_ids && resolved_issue_ids.length > 0) {
+                resolved_issue_ids.forEach(issue_id => {
+                    statements.push(
+                        db.prepare(
+                            "UPDATE issues SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, action_taken = ? WHERE issue_id = ?"
+                        ).bind(changes_made, issue_id)
+                    );
+                });
+            }
+
             const results = await db.batch(statements);
             return results.every(r => r.success);
         },
@@ -773,6 +786,13 @@ export const getDb = (db) => {
                 "DELETE FROM issues WHERE issue_id = ?"
             ).bind(issue_id).run();
             return success;
+        },
+
+        async getPendingIssuesByDeviceId(device_id) {
+            const { results } = await db.prepare(
+                "SELECT issue_id, description, reported_at, student_class, student_div, student_roll_no FROM issues WHERE device_id = ? AND status = 'pending' ORDER BY reported_at DESC"
+            ).bind(device_id).all();
+            return results;
         },
 
         async capitalizeExistingNames() {

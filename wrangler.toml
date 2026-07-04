@@ -3,9 +3,11 @@ main = "src/index.js"
 compatibility_date = "2025-11-21"
 
 [vars]
-JWT_SECRET = "your_super_secret_jwt_key_here"
-GOOGLE_CLIENT_ID = "your_google_client_id"
-GOOGLE_CLIENT_SECRET = "your_google_client_secret"
+JWT_SECRET = "deadstocktokengeneration"
+WHATSAPP_PHONE_NUMBER_ID = "1177104812156293"
+WHATSAPP_ACCESS_TOKEN = "EAAXA1ZAXA9gMBR7xelgH4D4sJjhaj9v6o4pZAt9ggROXyaJ3bCBaRById8B90BKOZChxXdAe5jQYQS9zZCoLz2KHOfMDCdQE2lrpRNAR527PXwsRmZAcFzb44SrOZBfoVB3PGsKRmQKmgtOVl82crzwREnjZAcLXNfNgr0Ew14nZCFcnFMDrT1FjSkrm0OdpapwkX12cgOgYhDKHZCqgTvGnySNOP7XEXlTF9dLbVzBzrf7k5Jggv547UD8nvEdLk8GnaDTfdJgBxD6V7fPbRvNkZA"
+WHATSAPP_TEMPLATE_NAME = "hello_world"
+WHATSAPP_TEMPLATE_LANG = "en_US"
 
 # Correct format
 [[d1_databases]]
